@@ -18,6 +18,13 @@ function db() {
             tid VARCHAR(100) NOT NULL UNIQUE, client_id INT NOT NULL, amt DECIMAL(12,2) NOT NULL,
             trx_date DATE NOT NULL, notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (client_id) REFERENCES clients(id))");
+        // My Loans: money the owner owes. Paid amount is never stored, it is the sum of my_loan_payments.
+        $p->exec("CREATE TABLE IF NOT EXISTS my_loans (id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(150) NOT NULL, amt DECIMAL(12,2) NOT NULL, loan_date DATE NULL, reason TEXT NULL,
+            encoded_at DATETIME NOT NULL, settled_at DATETIME NULL, INDEX (name))");
+        $p->exec("CREATE TABLE IF NOT EXISTS my_loan_payments (id INT AUTO_INCREMENT PRIMARY KEY,
+            loan_id INT NOT NULL, amt DECIMAL(12,2) NOT NULL, paid_at DATETIME NOT NULL,
+            FOREIGN KEY (loan_id) REFERENCES my_loans(id) ON DELETE CASCADE)");
         $col = $p->query("SHOW COLUMNS FROM transactions LIKE 'trx_date'")->fetch();
         if ($col && stripos($col['Type'], 'datetime') !== false) $p->exec("ALTER TABLE transactions MODIFY trx_date DATE NOT NULL");
     }
@@ -63,6 +70,23 @@ function readTrx($in, $editId = 0) {
     if (!preg_match('/^\d{1,9}(\.\d{1,2})?$/', $a) || (float)$a <= 0) throw new Exception('Amount must be greater than 0, with up to 2 decimal places.');
     $a = round((float)$a, 2);
     return [$tid, $in['type'] === 'loan' ? -$a : $a, mkDate($in['date'] ?? ''), trim($in['notes'] ?? '')];
+}
+
+function myAmt($a) {
+    $a = str_replace(',', '', trim((string)$a));
+    if (!preg_match('/^\d{1,9}(\.\d{1,2})?$/', $a) || (float)$a <= 0) throw new Exception('Amount must be greater than 0, with up to 2 decimal places.');
+    return (int)round((float)$a * 100);   // work in centavos to avoid rounding errors
+}
+// Unpaid loans (optionally one loan / one name), oldest first: date borrowed, else time encoded. Locked for update.
+function myOpen($where, $args) {
+    $s = db()->prepare("SELECT l.id, ROUND(l.amt*100) - COALESCE((SELECT ROUND(SUM(p.amt)*100) FROM my_loan_payments p WHERE p.loan_id=l.id),0) lft
+        FROM my_loans l WHERE l.settled_at IS NULL AND $where ORDER BY COALESCE(CAST(l.loan_date AS DATETIME), l.encoded_at), l.id FOR UPDATE");
+    $s->execute($args);
+    return $s->fetchAll();
+}
+function myPay($id, $cents, $left, $now) {
+    db()->prepare("INSERT INTO my_loan_payments(loan_id,amt,paid_at) VALUES(?,?,?)")->execute([$id, $cents / 100, $now]);
+    if ($cents >= $left) db()->prepare("UPDATE my_loans SET settled_at=? WHERE id=?")->execute([$now, $id]);
 }
 
 if (isset($_GET['api'])) {
@@ -206,6 +230,62 @@ if (isset($_GET['api'])) {
                 check($cid);
                 $pdo->commit();
                 echo json_encode(['ok' => true, 'bal' => balance($cid)]);
+                break;
+            case 'myLoans':
+                $out = $pdo->query("SELECT l.id,l.name,l.amt,l.loan_date,l.reason,l.encoded_at,l.settled_at,
+                    COALESCE((SELECT SUM(p.amt) FROM my_loan_payments p WHERE p.loan_id=l.id),0) paid FROM my_loans l")->fetchAll();
+                $f = fn($d) => date('F j, Y: g:iA', strtotime($d));
+                $out = array_map(fn($l) => ['id' => (int)$l['id'], 'name' => $l['name'], 'amt' => (float)$l['amt'], 'paid' => (float)$l['paid'],
+                    'date' => $l['loan_date'] ?? '', 'reason' => $l['reason'] ?? '',
+                    'at' => date('Y-m-d\TH:i:s', strtotime($l['encoded_at'])), 'encoded' => $f($l['encoded_at']),
+                    'settledAt' => $l['settled_at'] ? date('Y-m-d\TH:i:s', strtotime($l['settled_at'])) : '',
+                    'settled' => $l['settled_at'] ? $f($l['settled_at']) : ''], $out);
+                echo json_encode(['ok' => true, 'loans' => $out]);
+                break;
+            case 'addMyLoan':
+                $n = preg_replace('/\s+/', ' ', trim($in['name'] ?? ''));
+                if ($n === '') throw new Exception('Enter who you owe.');
+                if (mb_strlen($n) > 150) throw new Exception('Name is too long (150 characters max).');
+                $s = $pdo->prepare("SELECT name FROM my_loans WHERE name=? LIMIT 1");   // reuse the existing spelling
+                $s->execute([$n]);
+                $n = $s->fetchColumn() ?: $n;
+                $c = myAmt($in['amount'] ?? '');
+                $d = trim($in['date'] ?? '');
+                $d = $d === '' ? null : mkDate($d);
+                $r = trim($in['reason'] ?? '');
+                $pdo->prepare("INSERT INTO my_loans(name,amt,loan_date,reason,encoded_at) VALUES(?,?,?,?,?)")
+                    ->execute([$n, $c / 100, $d, $r === '' ? null : $r, date('Y-m-d H:i:s')]);
+                echo json_encode(['ok' => true]);
+                break;
+            case 'settleMyLoan':
+                $pdo->beginTransaction();
+                $l = myOpen('l.id=?', [(int)($in['id'] ?? 0)]);
+                if (!$l) throw new Exception('This loan was not found or is already settled.');
+                myPay($l[0]['id'], (int)$l[0]['lft'], (int)$l[0]['lft'], date('Y-m-d H:i:s'));
+                $pdo->commit();
+                echo json_encode(['ok' => true]);
+                break;
+            case 'customSettle':   // pays the oldest unpaid loans of one person first
+                $n = preg_replace('/\s+/', ' ', trim($in['name'] ?? ''));
+                $c = myAmt($in['amount'] ?? '');
+                $pdo->beginTransaction();
+                $open = myOpen('l.name=?', [$n]);
+                $owed = array_sum(array_column($open, 'lft'));
+                if (!$owed) throw new Exception($n === '' ? 'Enter who you paid.' : "You have no unpaid loans to $n.");
+                if ($c > $owed) throw new Exception("That's more than you owe $n (" . php($owed / 100) . ").");
+                $now = date('Y-m-d H:i:s');
+                foreach ($open as $l) {
+                    if ($c <= 0) break;
+                    $p = min($c, (int)$l['lft']);
+                    myPay($l['id'], $p, (int)$l['lft'], $now);
+                    $c -= $p;
+                }
+                $pdo->commit();
+                echo json_encode(['ok' => true]);
+                break;
+            case 'deleteMyLoan':
+                $pdo->prepare("DELETE FROM my_loans WHERE id=?")->execute([(int)($in['id'] ?? 0)]);
+                echo json_encode(['ok' => true]);
                 break;
             default:
                 throw new Exception('Unknown action.');
@@ -395,6 +475,7 @@ dialog.sm{max-width:440px}dialog::backdrop{background:rgba(20,30,25,.5)}
   <button class="tab on" data-p="dash"><svg class="i"><use href="#i-dash"/></svg>Dashboard</button>
   <button class="tab" data-p="clients"><svg class="i"><use href="#i-users"/></svg>Clients</button>
   <button class="tab" data-p="trx"><svg class="i"><use href="#i-swap"/></svg>Transactions</button>
+  <button class="tab" data-p="mine"><svg class="i"><use href="#i-inbox"/></svg>My Loans</button>
 </div></nav>
 
 <main class="wrap">
@@ -442,6 +523,32 @@ dialog.sm{max-width:440px}dialog::backdrop{background:rgba(20,30,25,.5)}
       <div class="sum" id="stSum"></div>
     </section>
   </section>
+  <section class="panel" id="p-mine">
+    <div class="ph"><div><h2>My Loans</h2><p>Money you owe to other people.</p></div>
+      <div class="acts"><button class="btn pri" id="mCustom"><svg class="i"><use href="#i-check"/></svg>Custom settlement</button></div></div>
+    <div class="card" style="margin-bottom:var(--s5)"><form class="card-b" id="mForm" novalidate>
+      <div class="alert" role="alert" hidden></div>
+      <div class="g2"><div class="fld"><label for="mName">Who I owe</label><input id="mName" list="mNames" autocomplete="off" placeholder="Start typing a name">
+          <p class="hint">Pick a suggestion so one person isn't saved under two spellings.</p></div>
+        <div class="fld"><label for="mAmt">How much (₱)</label><input id="mAmt" inputmode="decimal" placeholder="0.00"></div></div>
+      <div class="g2"><div class="fld"><label for="mDate">Date borrowed <em>optional</em></label><input type="date" id="mDate">
+          <p class="hint">If you don't input a date, the date as of encoding will be saved instead.</p></div>
+        <div class="fld"><label for="mReason">Reason <em>optional</em></label><input id="mReason" autocomplete="off" placeholder="What the loan was for"></div></div>
+      <button class="btn pri" type="submit"><svg class="i"><use href="#i-plus"/></svg>Add loan</button>
+    </form></div>
+    <datalist id="mNames"></datalist>
+    <div class="card" style="margin-bottom:var(--s5)"><div class="card-h"><h3>Unpaid loans</h3><p>Settle pays one loan in full. Custom settlement pays the oldest loan first.</p></div>
+      <div class="filters">
+        <div><label for="mfName">Name</label><input id="mfName" list="mNames" autocomplete="off" placeholder="Search a name"></div>
+        <div><label for="mfFrom">From</label><input type="date" id="mfFrom"></div>
+        <div><label for="mfTo">To</label><input type="date" id="mfTo"></div>
+        <div><label for="mfSort">Sort</label><select id="mfSort"><option value="dd">Date: newest first</option><option value="da">Date: oldest first</option><option value="na">Name: A to Z</option><option value="nd">Name: Z to A</option></select></div>
+      </div>
+      <div class="filters-f"><button class="chip" id="mfReset">Reset filters</button></div>
+      <div class="tw" id="mTable"></div>
+      <div class="owed-row" id="mTotal"></div></div>
+    <div class="card"><div class="card-h"><h3>Settled loans</h3><p>Fully paid loans, with the day each was settled. Filters above apply here too.</p></div><div class="tw" id="mSettled"></div></div>
+  </section>
 </main>
 
 <dialog id="adlg" aria-labelledby="adT"><form class="dlg-in" id="aForm" novalidate>
@@ -452,6 +559,14 @@ dialog.sm{max-width:440px}dialog::backdrop{background:rgba(20,30,25,.5)}
   <div class="dlg-f"><button type="button" class="btn" data-x>Cancel</button><button class="btn pri" type="submit">Save client</button></div>
 </form></dialog>
 <dialog id="tdlg" aria-labelledby="tdT"></dialog>
+<dialog id="sdlg" class="sm" aria-labelledby="sdT"><form class="dlg-in" id="sForm" novalidate>
+  <div class="dlg-h"><div><h3 id="sdT">Custom settlement</h3><p>The amount pays the oldest loan first, then the next one.</p></div><button type="button" class="ib" data-x aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button></div>
+  <div class="dlg-b"><div class="alert" role="alert" hidden></div>
+    <div class="fld"><label for="sName">Who you paid</label><input id="sName" list="mNames" autocomplete="off" placeholder="Start typing a name"></div>
+    <div class="fld"><label for="sAmt">Amount paid (₱)</label><input id="sAmt" inputmode="decimal" placeholder="0.00"><p class="hint" id="sOwed"></p></div>
+    <div id="sPrev"></div></div>
+  <div class="dlg-f"><button type="button" class="btn" data-x>Cancel</button><button class="btn pri" type="submit">Apply settlement</button></div>
+</form></dialog>
 <dialog id="cdlg" class="sm"></dialog>
 <dialog id="rdlg" class="sm"></dialog>
 <div id="ulayer" popover="manual" aria-live="polite"></div>
@@ -540,6 +655,7 @@ function confirmDlg({title,body,yes}){return new Promise(res=>{const d=$('#cdlg'
 
 // ---------- navigation ----------
 async function show(p){S.view=p;document.body.classList.toggle('wide',p==='trx');$$('.panel').forEach(e=>e.classList.toggle('on',e.id==='p-'+p));$$('.tab').forEach(b=>b.classList.toggle('on',b.dataset.p===p));
+  if(p==='mine'){try{await renderMine()}catch(e){toast(e.message,1)}return}
   try{await loadClients();if(p==='dash')await renderDash();if(p==='clients')renderClients();if(p==='trx')await renderLedger()}catch(e){toast(e.message,1)}}
 const refresh=()=>show(S.view);
 $$('.tab').forEach(b=>b.onclick=()=>show(b.dataset.p));
@@ -586,6 +702,65 @@ $('#aForm').onsubmit=async e=>{e.preventDefault();const d=$('#adlg'),i=$('#cname
   try{const r=await api('addClient',{name:i.value});d.close();toast('Client saved: '+r.name);refresh()}
   catch(x){fail(d,x.message,i);if(/already exists/.test(x.message))i.value=i.value.trim().replace(/\s+/g,' ')+'_'}
   finally{b.disabled=false}};
+
+// ---------- my loans (stored in MySQL: my_loans + my_loan_payments) ----------
+S.mine=[];
+const r2=x=>Math.round(x*100)/100,left=x=>r2(x.amt-(x.paid||0)),okAmt=a=>/^\d{1,9}(\.\d{1,2})?$/.test(a)&&+a>0;
+// a loan's date: the date borrowed, else the moment it was encoded
+const mDay=x=>x.date||x.at.slice(0,10),mTime=x=>new Date(x.date?x.date+'T00:00':x.at).getTime();
+const midnight=t=>{const d=new Date(t);d.setHours(0,0,0,0);return d.getTime()};
+const mDays=x=>Math.max(0,Math.round((midnight(x.settledAt?new Date(x.settledAt):Date.now())-midnight(mTime(x)))/864e5));
+const dayTxt=n=>n?n+' day'+(n>1?'s':''):'Today';
+const dateCell=x=>x.date?fdate(x.date):`<span class="mute">(Encoded on: ${esc(x.encoded)})</span>`;
+const mNamesList=()=>[...new Set(S.mine.map(x=>x.name))].sort((a,b)=>a.localeCompare(b));
+// reuse an existing spelling when the typed name matches it ignoring case/spaces
+const canon=n=>{n=n.trim().replace(/\s+/g,' ');return mNamesList().find(x=>x.toLowerCase()===n.toLowerCase())||n};
+const oldestFirst=(a,b)=>mTime(a)-mTime(b)||a.id-b.id;
+// preview only; the server does the real allocation the same way
+function allocate(name,amt){let r=r2(amt);const out=[];
+  for(const x of S.mine.filter(x=>x.name===name&&left(x)>0).sort(oldestFirst)){if(r<=0)break;const p=Math.min(r,left(x));out.push({x,p});r=r2(r-p)}return out}
+async function renderMine(){S.mine=(await api('myLoans')).loans;drawMine()}
+function drawMine(){const all=S.mine,names=mNamesList(),q=$('#mfName').value.trim().toLowerCase(),from=$('#mfFrom').value,to=$('#mfTo').value,so=$('#mfSort').value;
+  $('#mNames').innerHTML=names.map(n=>`<option value="${esc(n)}">`).join('');
+  const hit=x=>(!q||x.name.toLowerCase().includes(q))&&(!from||mDay(x)>=from)&&(!to||mDay(x)<=to);
+  const srt=(a,b)=>so==='da'?oldestFirst(a,b):so==='na'?a.name.localeCompare(b.name)||mTime(b)-mTime(a):so==='nd'?b.name.localeCompare(a.name)||mTime(b)-mTime(a):mTime(b)-mTime(a)||b.id-a.id;
+  const open=all.filter(x=>!x.settledAt&&hit(x)).sort(srt),done=all.filter(x=>x.settledAt&&hit(x)).sort(srt);
+  const tot=r2(open.reduce((s,x)=>s+left(x),0)),people=new Set(open.map(x=>x.name)),none=all.length?'No loans match these filters.':'No loans recorded. Add one above.';
+  $('#mTable').innerHTML=open.length?`<table><thead><tr><th>Who I owe</th><th>Date borrowed</th><th class="num">Days</th><th>Reason</th><th class="num">Amount</th><th class="num">Remaining</th><th></th></tr></thead><tbody>${open.map(x=>`<tr><td>${esc(x.name)}</td><td>${dateCell(x)}</td><td class="num">${dayTxt(mDays(x))}</td><td>${x.reason?esc(x.reason):'<span class="mute">—</span>'}</td><td class="num">${money(x.amt)}</td><td class="num neg">${money(left(x))}${x.paid?`<small class="mute" style="display:block;font-weight:400">${money(x.paid)} paid</small>`:''}</td><td class="act"><button class="btn" style="padding:5px 12px" data-ms="${x.id}">Settle</button><button class="ib" data-md="${x.id}" title="Delete" aria-label="Delete loan from ${esc(x.name)}">${ico('trash')}</button></td></tr>`).join('')}</tbody></table>`
+    :`<div class="empty">${ico('inbox')}<span>${all.some(x=>!x.settledAt)?none:all.length?'Everything is settled.':none}</span></div>`;
+  $('#mTotal').style.display=open.length?'':'none';
+  $('#mTotal').innerHTML=open.length?`<div><span>You owe</span><small>${open.length} unpaid loan${open.length>1?'s':''}${from||to?` &middot; ${from?fdate(from):'start'} to ${to?fdate(to):'today'}`:''}</small></div><span style="display:flex;align-items:center;gap:var(--s4);flex-wrap:wrap;justify-content:flex-end"><b class="neg">${money(tot)}${people.size===1?` <span style="font-weight:600">to ${esc([...people][0])}</span>`:''}</b><button class="btn pri" data-mc>Custom settlement</button></span>`:'';
+  $('#mSettled').innerHTML=done.length?`<table><thead><tr><th>Who I owed</th><th>Date borrowed</th><th>Settled on</th><th class="num">Took</th><th>Reason</th><th class="num">Amount</th><th></th></tr></thead><tbody>${done.map(x=>`<tr><td>${esc(x.name)}</td><td>${dateCell(x)}</td><td>${esc(x.settled)}</td><td class="num">${dayTxt(mDays(x))}</td><td>${x.reason?esc(x.reason):'<span class="mute">—</span>'}</td><td class="num pos">${money(x.amt)}</td><td class="act"><button class="ib" data-md="${x.id}" title="Delete" aria-label="Delete settled loan from ${esc(x.name)}">${ico('trash')}</button></td></tr>`).join('')}</tbody></table>`
+    :`<div class="empty">${ico('check')}<span>No settled loans${q||from||to?' match these filters':' yet'}.</span></div>`;
+  $$('#p-mine [data-mc]').forEach(b=>b.onclick=()=>$('#mCustom').click());
+  $$('#p-mine [data-md]').forEach(b=>b.onclick=async()=>{if(!await confirmDlg({title:'Delete this loan?',body:'This removes it and its payments from My Loans completely.',yes:'Delete'}))return;
+    try{await api('deleteMyLoan',{id:+b.dataset.md});toast('Loan deleted');await renderMine()}catch(e){toast(e.message,1)}});
+  $$('#p-mine [data-ms]').forEach(b=>b.onclick=async()=>{const x=S.mine.find(z=>z.id==b.dataset.ms);
+    if(!await confirmDlg({title:'Settle this loan?',body:`Mark ${money(left(x))} to ${esc(x.name)} as paid today.`,yes:'Settle'}))return;
+    try{await api('settleMyLoan',{id:x.id});toast(`Settled ${money(x.amt)} to ${x.name}`);await renderMine()}catch(e){toast(e.message,1)}})}
+$('#mForm').onsubmit=async e=>{e.preventDefault();const f=e.target,b=$('button[type=submit]',f);$('.alert',f).hidden=true;
+  const name=canon($('#mName').value),a=$('#mAmt').value.replace(/,/g,'').trim();
+  if(!name)return fail(f,'Enter who you owe.',$('#mName'));
+  if(!okAmt(a))return fail(f,'Amount must be greater than 0, with up to 2 decimal places.',$('#mAmt'));
+  b.disabled=true;
+  try{await api('addMyLoan',{name,amount:a,date:$('#mDate').value,reason:$('#mReason').value});f.reset();toast('Loan added');await renderMine();$('#mName').focus()}
+  catch(x){fail(f,x.message)}finally{b.disabled=false}};
+['mfFrom','mfTo','mfSort'].forEach(i=>$('#'+i).onchange=drawMine);$('#mfName').oninput=drawMine;
+$('#mfReset').onclick=()=>{$('#mfName').value='';$('#mfFrom').value='';$('#mfTo').value='';$('#mfSort').value='dd';drawMine()};
+// custom settlement: preview how the amount spreads over the oldest loans
+function sPreview(){const name=canon($('#sName').value),a=$('#sAmt').value.replace(/,/g,'').trim(),owed=r2(S.mine.filter(x=>x.name===name&&left(x)>0).reduce((s,x)=>s+left(x),0));
+  $('#sOwed').textContent=owed?`You owe ${money(owed)} to ${name}.`:'';
+  $('#sPrev').innerHTML=owed&&okAmt(a)?`<div class="lbl">What this pays</div>`+allocate(name,Math.min(+a,owed)).map(({x,p})=>`<div class="li"><span>${money(x.amt)} loan<small>${dateCell(x)}</small></span><span style="text-align:right">${p>=left(x)?'<span class="tag p">Paid</span>':`<span class="tag l">Deduct ${money(p)}</span><small style="margin-top:2px">Remaining: ${money(r2(left(x)-p))}</small>`}</span></div>`).join(''):'';
+  return {name,a,owed}}
+$('#mCustom').onclick=()=>{const d=$('#sdlg');$('.alert',d).hidden=true;$('#sForm').reset();
+  const q=$('#mfName').value.trim();if(mNamesList().includes(canon(q)))$('#sName').value=canon(q);sPreview();d.showModal();($('#sName').value?$('#sAmt'):$('#sName')).focus()};
+wire($('#sdlg'));$('#sName').oninput=sPreview;$('#sAmt').oninput=sPreview;
+$('#sForm').onsubmit=async e=>{e.preventDefault();const d=$('#sdlg'),b=$('button[type=submit]',d);$('.alert',d).hidden=true;const {name,a,owed}=sPreview();
+  if(!owed)return fail(d,name?`You have no unpaid loans to ${name}.`:'Enter who you paid.',$('#sName'));
+  if(!okAmt(a))return fail(d,'Amount must be greater than 0, with up to 2 decimal places.',$('#sAmt'));
+  if(+a>owed)return fail(d,`That's more than you owe ${name} (${money(owed)}).`,$('#sAmt'));
+  b.disabled=true;
+  try{await api('customSettle',{name,amount:a});d.close();toast(`Paid ${money(+a)} to ${name}`);await renderMine()}catch(x){fail(d,x.message)}finally{b.disabled=false}};
 
 // ---------- transaction dialog (new + edit share one form) ----------
 function openTrx({edit=null,clientId=0}={}){const d=$('#tdlg');
