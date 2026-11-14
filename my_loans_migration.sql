@@ -36,3 +36,17 @@ CREATE TABLE IF NOT EXISTS my_loan_payments (
 -- collection_receipt: the collection receipt given when a loan is settled (one per settlement).
 ALTER TABLE my_loans         ADD COLUMN IF NOT EXISTS receipt_no         VARCHAR(100) NULL;
 ALTER TABLE my_loan_payments ADD COLUMN IF NOT EXISTS collection_receipt VARCHAR(100) NULL;
+
+-- Small Loans tab: a quick list of small loans, settled with one checkbox.
+-- Only ADDS a new table. settled_on is NULL while unpaid, else the day it was ticked.
+CREATE TABLE IF NOT EXISTS small_loans (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(150)  NOT NULL,           -- who borrowed
+    amt         DECIMAL(12,2) NOT NULL,           -- amount (PHP)
+    loan_date   DATE          NOT NULL,           -- date of the loan (today if left empty)
+    note        TEXT          NULL,               -- optional note
+    settled_on  DATE          NULL,               -- day it was marked settled
+    created_at  TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+    INDEX (name),
+    INDEX (loan_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -28,6 +28,10 @@ function db() {
         // Receipt numbers: the loan's receipt (required for new loans) and the collection receipt of each settlement.
         if (!$p->query("SHOW COLUMNS FROM my_loans LIKE 'receipt_no'")->fetch()) $p->exec("ALTER TABLE my_loans ADD COLUMN receipt_no VARCHAR(100) NULL");
         if (!$p->query("SHOW COLUMNS FROM my_loan_payments LIKE 'collection_receipt'")->fetch()) $p->exec("ALTER TABLE my_loan_payments ADD COLUMN collection_receipt VARCHAR(100) NULL");
+        // Small Loans: quick list, settled with one checkbox (settled_on is NULL while unpaid).
+        $p->exec("CREATE TABLE IF NOT EXISTS small_loans (id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(150) NOT NULL, amt DECIMAL(12,2) NOT NULL, loan_date DATE NOT NULL, note TEXT NULL,
+            settled_on DATE NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX (name), INDEX (loan_date))");
         $col = $p->query("SHOW COLUMNS FROM transactions LIKE 'trx_date'")->fetch();
         if ($col && stripos($col['Type'], 'datetime') !== false) $p->exec("ALTER TABLE transactions MODIFY trx_date DATE NOT NULL");
     }
@@ -305,6 +309,44 @@ if (isset($_GET['api'])) {
                 $pdo->prepare("DELETE FROM my_loans WHERE id=?")->execute([(int)($in['id'] ?? 0)]);
                 echo json_encode(['ok' => true]);
                 break;
+            case 'smallLoans':
+                $out = $pdo->query("SELECT id,name,amt,loan_date,note,settled_on FROM small_loans")->fetchAll();
+                echo json_encode(['ok' => true, 'loans' => array_map(fn($l) => ['id' => (int)$l['id'], 'name' => $l['name'], 'amt' => (float)$l['amt'],
+                    'date' => $l['loan_date'], 'note' => $l['note'] ?? '', 'done' => $l['settled_on']], $out)]);
+                break;
+            case 'addSmall':
+                $n = trim(preg_replace('/\s+/', ' ', $in['name'] ?? ''));
+                if ($n === '' || mb_strlen($n) > 150) throw new Exception('Enter a name.');
+                $a = str_replace(',', '', trim((string)($in['amt'] ?? '')));
+                if (!preg_match('/^\d{1,9}(\.\d{1,2})?$/', $a) || $a <= 0) throw new Exception('Enter a valid amount, e.g. 150 or 150.50.');
+                $d = $in['date'] ?? '';
+                if (!$d) $d = date('Y-m-d');
+                elseif (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) || !strtotime($d)) throw new Exception('Enter a valid date.');
+                $done = !empty($in['done']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $in['done']) ? $in['done'] : null;
+                $s = $pdo->prepare("SELECT name FROM small_loans WHERE LOWER(name)=LOWER(?) LIMIT 1");
+                $s->execute([$n]);
+                if ($ex = $s->fetchColumn()) $n = $ex;   // keep the first spelling of a name
+                $pdo->prepare("INSERT INTO small_loans(name,amt,loan_date,note,settled_on) VALUES(?,?,?,?,?)")
+                    ->execute([$n, $a, $d, trim($in['note'] ?? '') ?: null, $done]);
+                echo json_encode(['ok' => true]);
+                break;
+            case 'updateSmall':   // edit one field: name, note or amt
+                $id = (int)($in['id'] ?? 0); $f = $in['field'] ?? ''; $v = trim(preg_replace('/\s+/', ' ', (string)($in['value'] ?? '')));
+                if ($f === 'name') { if ($v === '' || mb_strlen($v) > 150) throw new Exception('Name cannot be empty.'); }
+                elseif ($f === 'amt') { $v = str_replace(',', '', $v); if (!preg_match('/^\d{1,9}(\.\d{1,2})?$/', $v) || $v <= 0) throw new Exception('Enter a valid amount, e.g. 150 or 150.50.'); }
+                elseif ($f === 'note') { $v = $v === '' ? null : $v; }
+                else throw new Exception('Unknown field.');
+                $pdo->prepare("UPDATE small_loans SET $f=? WHERE id=?")->execute([$v, $id]);   // $f is whitelisted above
+                echo json_encode(['ok' => true]);
+                break;
+            case 'settleSmall':   // checkbox: done=true marks settled today, false marks unpaid
+                $pdo->prepare("UPDATE small_loans SET settled_on=? WHERE id=?")->execute([!empty($in['done']) ? date('Y-m-d') : null, (int)($in['id'] ?? 0)]);
+                echo json_encode(['ok' => true]);
+                break;
+            case 'deleteSmall':
+                $pdo->prepare("DELETE FROM small_loans WHERE id=?")->execute([(int)($in['id'] ?? 0)]);
+                echo json_encode(['ok' => true]);
+                break;
             default:
                 throw new Exception('Unknown action.');
         }
@@ -494,6 +536,7 @@ dialog.sm{max-width:440px}dialog::backdrop{background:rgba(20,30,25,.5)}
   <button class="tab" data-p="clients"><svg class="i"><use href="#i-users"/></svg>Clients</button>
   <button class="tab" data-p="trx"><svg class="i"><use href="#i-swap"/></svg>Transactions</button>
   <button class="tab" data-p="mine"><svg class="i"><use href="#i-inbox"/></svg>My Loans</button>
+  <button class="tab" data-p="small"><svg class="i"><use href="#i-list"/></svg>Small Loans</button>
 </div></nav>
 
 <main class="wrap">
@@ -568,6 +611,21 @@ dialog.sm{max-width:440px}dialog::backdrop{background:rgba(20,30,25,.5)}
       <div class="tw" id="mTable"></div>
       <div class="owed-row" id="mTotal"></div></div>
     <div class="card"><div class="card-h"><h3>Settled loans</h3><p>Fully paid loans, with the day each was settled. Filters above apply here too.</p></div><div class="tw" id="mSettled"></div></div>
+  </section>
+  <section class="panel" id="p-small">
+    <div class="ph"><div><h2>Small Loans</h2><p>Type a new loan in the top row of the table and press Enter. Tick the box to mark one settled.</p></div></div>
+    <datalist id="slNames"></datalist>
+    <div class="card"><div class="card-h"><h3>Small loans</h3><p>Click a name, note or amount to edit it.</p></div>
+      <div class="filters">
+        <div><label for="slfName">Name</label><input id="slfName" list="slNames" autocomplete="off" placeholder="Search a name"></div>
+        <div><label for="slfFrom">From</label><input type="date" id="slfFrom"></div>
+        <div><label for="slfTo">To</label><input type="date" id="slfTo"></div>
+        <div><label for="slfSt">Show</label><select id="slfSt"><option value="all">All</option><option value="open">Unpaid only</option><option value="done">Settled only</option></select></div>
+      </div>
+      <div class="filters-f"><button class="chip" id="slfReset">Reset filters</button></div>
+      <div class="alert" id="slErr" role="alert" hidden style="margin:0 var(--s4) var(--s3)"></div>
+      <div class="tw" id="slTable"></div>
+      <div class="owed-row" id="slTotal"></div></div>
   </section>
 </main>
 
@@ -685,6 +743,7 @@ function confirmDlg({title,body,yes}){return new Promise(res=>{const d=$('#cdlg'
 
 // ---------- navigation ----------
 async function show(p){S.view=p;document.body.classList.toggle('wide',p==='trx');$$('.panel').forEach(e=>e.classList.toggle('on',e.id==='p-'+p));$$('.tab').forEach(b=>b.classList.toggle('on',b.dataset.p===p));
+  if(p==='small'){try{await renderSmall()}catch(e){toast(e.message,1)}return}
   if(p==='mine'){try{await renderMine()}catch(e){toast(e.message,1)}return}
   try{await loadClients();if(p==='dash')await renderDash();if(p==='clients')renderClients();if(p==='trx')await renderLedger()}catch(e){toast(e.message,1)}}
 const refresh=()=>show(S.view);
@@ -896,6 +955,38 @@ $('#xlsBtn').onclick=()=>{if(!S.H)return;
   catch(e){toast('Could not create the Excel file: '+e.message,1)}};
 
 show('dash');
+// ---------- small loans (stored in MySQL: small_loans) ----------
+S.small=[];
+const slLoad=()=>S.small;
+async function slDo(a,d){try{await api(a,d)}catch(e){toast(e.message,1)}await renderSmall()}
+async function renderSmall(){
+  // one-time move of loans saved in this browser by the earlier prototype
+  let old=[];try{old=JSON.parse(localStorage.getItem('smallLoans'))||[]}catch(e){}
+  if(old.length){for(const x of old)await api('addSmall',x);try{localStorage.removeItem('smallLoans')}catch(e){}toast(`Moved ${old.length} small loan(s) from this browser into the database.`)}
+  S.small=(await api('smallLoans')).loans;drawSmall()}
+function drawSmall(){const all=slLoad(),q=$('#slfName').value.trim().toLowerCase(),from=$('#slfFrom').value,to=$('#slfTo').value,st=$('#slfSt').value;
+  $('#slNames').innerHTML=[...new Set(all.map(x=>x.name))].sort().map(n=>`<option value="${esc(n)}">`).join('');
+  const l=all.filter(x=>(!q||x.name.toLowerCase().includes(q))&&(!from||x.date>=from)&&(!to||x.date<=to)&&(st==='all'||(st==='done')===!!x.done)).sort((a,b)=>b.date.localeCompare(a.date)||b.id-a.id);
+  const inp='style="width:100%;min-width:90px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;background:var(--surface);color:var(--ink)"';
+  const ed=(x,f,v)=>`<span contenteditable="plaintext-only" data-sle="${x.id}" data-f="${f}" title="Click to edit" style="display:inline-block;min-width:40px;outline:none;border-bottom:1px dashed transparent;cursor:text" onfocus="this.style.borderBottomColor='var(--primary)'">${v}</span>`;
+  const addRow=`<tr style="background:var(--bg)"><td></td><td><input id="slName" list="slNames" autocomplete="off" placeholder="Name" ${inp}></td><td><input type="date" id="slDate" ${inp} title="Leave empty for today"></td><td><input id="slNote" autocomplete="off" placeholder="Note (optional)" ${inp}></td><td class="num"><input id="slAmt" inputmode="decimal" placeholder="0.00" ${inp} style="text-align:right;width:110px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit"></td><td class="act"><button class="btn pri" id="slAdd" style="padding:5px 12px" title="Add (Enter)">${ico('plus')}Add</button></td></tr>`;
+  $('#slTable').innerHTML=`<table><thead><tr><th style="width:1%">Settled</th><th>Name</th><th>Date</th><th>Note</th><th class="num">Amount</th><th></th></tr></thead><tbody>${addRow}${l.map(x=>`<tr${x.done?' style="opacity:.55"':''}><td><input type="checkbox" data-slc="${x.id}" ${x.done?'checked':''} aria-label="Settled: ${esc(x.name)}" style="width:18px;height:18px;cursor:pointer"></td><td${x.done?' style="text-decoration:line-through"':''}>${ed(x,'name',esc(x.name))}</td><td>${fdate(x.date)}${x.done?`<small class="mute" style="display:block">Settled ${fdate(x.done)}</small>`:''}</td><td>${ed(x,'note',esc(x.note||''))}</td><td class="num ${x.done?'pos':'neg'}">₱${ed(x,'amt',x.amt.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}))}</td><td class="act"><button class="ib" data-sld="${x.id}" title="Delete" aria-label="Delete">${ico('trash')}</button></td></tr>`).join('')}${l.length?'':`<tr><td colspan="6" class="mute" style="padding:var(--s4)">${all.length?'No small loans match these filters.':'No small loans yet. Type one in the row above.'}</td></tr>`}</tbody></table>`;
+  $('#slAdd').onclick=slAdd;['#slName','#slDate','#slNote','#slAmt'].forEach(k=>$(k).onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();slAdd()}});
+  $$('[data-sle]').forEach(c=>{const orig=c.textContent;c.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();c.blur()}if(e.key==='Escape'){c.textContent=orig;c.blur()}};
+    c.onblur=()=>{const v=c.textContent.trim().replace(/\s+/g,' ');if(v===orig.trim())return drawSmall();const x=slLoad().find(y=>y.id==c.dataset.sle);if(!x)return;const f=c.dataset.f;
+      if(f==='name'&&!v){toast('Name cannot be empty.',1);return drawSmall()}
+      if(f==='amt'&&!okAmt(v.replace(/,/g,''))){toast('Enter a valid amount, e.g. 150 or 150.50.',1);return drawSmall()}
+      slDo('updateSmall',{id:x.id,field:f,value:v}).then(()=>toast('Saved.'))}});
+  const un=l.filter(x=>!x.done),tu=r2(un.reduce((s,x)=>s+x.amt,0)),ts=r2(l.filter(x=>x.done).reduce((s,x)=>s+x.amt,0));
+  $('#slTotal').innerHTML=`<span>Unpaid (${un.length}): <b class="neg">${money(tu)}</b> &nbsp;·&nbsp; Settled: <b class="pos">${money(ts)}</b> &nbsp;·&nbsp; Total: <b>${money(r2(tu+ts))}</b></span>`;
+  $$('[data-slc]').forEach(c=>c.onchange=()=>slDo('settleSmall',{id:+c.dataset.slc,done:c.checked}).then(()=>toast(c.checked?'Marked settled.':'Marked unpaid.')));
+  $$('[data-sld]').forEach(b=>b.onclick=async()=>{if(!await confirmDlg({title:'Delete this small loan?',body:'It will be removed from the list.',yes:'Delete'}))return;slDo('deleteSmall',{id:+b.dataset.sld})})}
+function slAdd(){const err=$('#slErr');err.hidden=true;const bad=(m,el)=>{err.innerHTML=ico('alert')+`<span>${esc(m)}</span>`;err.hidden=false;el.focus()};
+  const name=$('#slName').value.trim().replace(/\s+/g,' '),a=$('#slAmt').value.replace(/,/g,'').trim();
+  if(!name)return bad('Enter a name.',$('#slName'));if(!okAmt(a))return bad('Enter a valid amount, e.g. 150 or 150.50.',$('#slAmt'));
+  api('addSmall',{name,amt:a,date:$('#slDate').value,note:$('#slNote').value.trim()}).then(async()=>{toast('Small loan added.');await renderSmall();$('#slName').focus()},e=>bad(e.message,$('#slName')))}
+['#slfName','#slfFrom','#slfTo','#slfSt'].forEach(k=>$(k).oninput=drawSmall);
+$('#slfReset').onclick=()=>{['#slfName','#slfFrom','#slfTo'].forEach(k=>$(k).value='');$('#slfSt').value='all';drawSmall()};
 </script>
 </body>
 </html>
