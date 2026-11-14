@@ -30,3 +30,9 @@ CREATE TABLE IF NOT EXISTS my_loan_payments (
     paid_at  DATETIME      NOT NULL,
     FOREIGN KEY (loan_id) REFERENCES my_loans(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Receipt numbers (added later). Only ADDS columns; existing loans keep an empty receipt number.
+-- receipt_no: the receipt of the loan (required for new loans in the app).
+-- collection_receipt: the collection receipt given when a loan is settled (one per settlement).
+ALTER TABLE my_loans         ADD COLUMN IF NOT EXISTS receipt_no         VARCHAR(100) NULL;
+ALTER TABLE my_loan_payments ADD COLUMN IF NOT EXISTS collection_receipt VARCHAR(100) NULL;
